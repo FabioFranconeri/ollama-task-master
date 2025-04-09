@@ -52,15 +52,8 @@ export const runInitCLI = async () => {
 // Export version information
 export const version = packageJson.version;
 
-// CLI implementation
-if (import.meta.url === `file://${process.argv[1]}`) {
-  const program = new Command();
-  
-  program
-    .name('task-master')
-    .description('Claude Task Master CLI')
-    .version(version);
-  
+// Export a function to register commands
+export const registerCommands = (program) => {
   program
     .command('init')
     .description('Initialize a new project')
@@ -129,6 +122,61 @@ if (import.meta.url === `file://${process.argv[1]}`) {
         process.exit(code);
       });
     });
+  
+  // Add expand task command
+  program
+    .command('expand')
+    .description('Expand a task with subtasks')
+    .option('-i, --id <id>', 'Task ID to expand')
+    .option('-n, --num <number>', 'Number of subtasks to generate', '3')
+    .action((options) => {
+      const args = ['expand'];
+      if (options.id) args.push(`--id=${options.id}`);
+      if (options.num) args.push(`--num=${options.num}`);
+      
+      const child = spawn('node', [devScriptPath, ...args], {
+        stdio: 'inherit',
+        cwd: process.cwd()
+      });
+      
+      child.on('close', (code) => {
+        process.exit(code);
+      });
+    });
+    
+  // Add set-status command
+  program
+    .command('set-status')
+    .description('Change the status of a task')
+    .option('-i, --id <id>', 'Task ID to update')
+    .option('-s, --status <status>', 'New status (e.g., "done", "pending")')
+    .action((options) => {
+      const args = ['set-status'];
+      if (options.id) args.push(`--id=${options.id}`);
+      if (options.status) args.push(`--status=${options.status}`);
+      
+      const child = spawn('node', [devScriptPath, ...args], {
+        stdio: 'inherit',
+        cwd: process.cwd()
+      });
+      
+      child.on('close', (code) => {
+        process.exit(code);
+      });
+    });
+};
+
+// CLI implementation
+if (import.meta.url === `file://${process.argv[1]}`) {
+  const program = new Command();
+  
+  program
+    .name('task-master')
+    .description('Claude Task Master CLI')
+    .version(version);
+  
+  // Register all commands
+  registerCommands(program);
   
   program.parse(process.argv);
 } 

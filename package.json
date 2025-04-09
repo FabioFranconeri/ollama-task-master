@@ -5,11 +5,12 @@
   "main": "index.js",
   "type": "module",
   "bin": {
-    "task-master": "./cli.js"
+    "task-master": "./cli.js",
+    "task-master-cmd": "./cli.cmd"
   },
   "scripts": {
     "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js",
-    "prepare": "husky install"
+    "prepare": "node -e \"try { if(process.env.npm_config_global !== 'true') { require('fs').statSync('./node_modules/husky'); require('child_process').spawnSync('npx', ['husky', 'install'], { stdio: 'inherit' }); } } catch(e) { console.log('Skipping husky install'); }\""
   },
   "keywords": [
     "task",
@@ -18,16 +19,18 @@
     "productivity",
     "ai"
   ],
-  "author": "Your Name",
+  "author": "Fabio Franconeri",
   "license": "MIT",
   "dependencies": {
     "ai": "^2.2.12",
+    "boxen": "^8.0.1",
     "chalk": "^5.3.0",
     "commander": "^10.0.1",
     "conf": "^12.0.0",
     "dotenv": "^16.0.3",
     "express": "^4.18.2",
     "figlet": "^1.6.0",
+    "gradient-string": "^3.0.0",
     "inquirer": "^9.2.7",
     "marked": "^5.1.0",
     "marked-terminal": "^5.2.0",
@@ -45,6 +48,6 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/yourusername/task-master-ai.git"
+    "url": "https://github.com/FabioFranconeri/ollama-task-master.git"
   }
 }
