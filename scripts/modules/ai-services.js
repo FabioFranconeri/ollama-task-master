@@ -5,7 +5,7 @@
 
 // NOTE/TODO: Include the beta header output-128k-2025-02-19 in your API request to increase the maximum output token length to 128k tokens for Claude 3.7 Sonnet.
 
-import { Anthropic } from '@anthropic-ai/sdk';
+import fetch from 'node-fetch';
 import OpenAI from 'openai';
 import dotenv from 'dotenv';
 import { CONFIG, log, sanitizePrompt } from './utils.js';
@@ -15,14 +15,9 @@ import chalk from 'chalk';
 // Load environment variables
 dotenv.config();
 
-// Configure Anthropic client
-const anthropic = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-  // Add beta header for 128k token output
-  defaultHeaders: {
-    'anthropic-beta': 'output-128k-2025-02-19'
-  }
-});
+// Configure Ollama client settings
+const OLLAMA_API_URL = process.env.OLLAMA_API_URL || 'http://localhost:11434';
+const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'llama3';
 
 // Lazy-loaded Perplexity client
 let perplexity = null;
@@ -36,6 +31,8 @@ function getPerplexityClient() {
     if (!process.env.PERPLEXITY_API_KEY) {
       throw new Error("PERPLEXITY_API_KEY environment variable is missing. Set it to use research-backed features.");
     }
+    
+    // Initialize with OpenAI client for backward compatibility
     perplexity = new OpenAI({
       apiKey: process.env.PERPLEXITY_API_KEY,
       baseURL: 'https://api.perplexity.ai',
@@ -45,48 +42,102 @@ function getPerplexityClient() {
 }
 
 /**
- * Handle Claude API errors with user-friendly messages
- * @param {Error} error - The error from Claude API
+ * Get research results from Perplexity
+ * @param {string} prompt - The research prompt
+ * @returns {Promise<string>} Research results
+ */
+async function getPerplexityResearch(prompt) {
+  const perplexityClient = getPerplexityClient();
+  const model = process.env.PERPLEXITY_MODEL || 'sonar-medium-online';
+  
+  const response = await perplexityClient.chat.completions.create({
+    model: model,
+    messages: [{ role: 'user', content: prompt }]
+  });
+  
+  return response.choices[0].message.content;
+}
+
+/**
+ * Handle Ollama API errors with user-friendly messages
+ * @param {Error} error - The error from Ollama API
  * @returns {string} User-friendly error message
  */
-function handleClaudeError(error) {
-  // Check if it's a structured error response
-  if (error.type === 'error' && error.error) {
-    switch (error.error.type) {
-      case 'overloaded_error':
-        return 'Claude is currently experiencing high demand and is overloaded. Please wait a few minutes and try again.';
-      case 'rate_limit_error':
-        return 'You have exceeded the rate limit. Please wait a few minutes before making more requests.';
-      case 'invalid_request_error':
-        return 'There was an issue with the request format. If this persists, please report it as a bug.';
+function handleOllamaError(error) {
+  // Check for connection errors
+  if (error.code === 'ECONNREFUSED' || error.code === 'ENOTFOUND') {
+    return `Could not connect to Ollama server at ${OLLAMA_API_URL}. Make sure Ollama is running.`;
+  }
+
+  // Check for timeout
+  if (error.type === 'request-timeout' || error.message?.toLowerCase().includes('timeout')) {
+    return 'The request to Ollama timed out. Your prompt might be too complex or the server is busy.';
+  }
+
+  // Check for HTTP errors
+  if (error.status) {
+    switch (error.status) {
+      case 404:
+        return `Model "${OLLAMA_MODEL}" not found. You may need to run: ollama pull ${OLLAMA_MODEL}`;
+      case 400:
+        return 'Bad request to Ollama API. The prompt might be malformed.';
+      case 500:
+        return 'Ollama server error. Check the Ollama logs for more details.';
       default:
-        return `Claude API error: ${error.error.message}`;
+        return `Ollama API error (${error.status}): ${error.message || 'Unknown error'}`;
     }
   }
   
   // Check for network/timeout errors
-  if (error.message?.toLowerCase().includes('timeout')) {
-    return 'The request to Claude timed out. Please try again.';
-  }
   if (error.message?.toLowerCase().includes('network')) {
-    return 'There was a network error connecting to Claude. Please check your internet connection and try again.';
+    return 'There was a network error connecting to Ollama. Please check your internet connection and try again.';
   }
   
   // Default error message
-  return `Error communicating with Claude: ${error.message}`;
+  return `Error communicating with Ollama: ${error.message || 'Unknown error'}`;
 }
 
 /**
- * Call Claude to generate tasks from a PRD
+ * Process Ollama's streaming response and fix any JSON escaping issues
+ * @param {string} text - Raw response text from Ollama
+ * @returns {string} Processed text with fixed JSON escaping
+ */
+function processOllamaResponse(text) {
+  try {
+    // 1. Fix common escape issues with single quotes inside JSON strings
+    // Replace problematic escape sequence \' with properly escaped \"'\"
+    text = text.replace(/\\'/g, "'");
+    
+    // 2. Fix other common JSON escaping issues
+    // Properly escape backslashes
+    text = text.replace(/\\(?=[^"ntbfr\/])/g, "\\\\");
+    
+    // 3. Fix broken quote escaping
+    // Replace \" with \\"
+    text = text.replace(/(?<!\\)\\"/g, '\\"');
+    
+    if (CONFIG.debug) {
+      log('debug', `Fixed JSON escaping issues`);
+    }
+    
+    return text;
+  } catch (error) {
+    log('error', `Error processing Ollama response: ${error.message}`);
+    return text; // Return original text if processing fails
+  }
+}
+
+/**
+ * Call Ollama to generate tasks from a PRD
  * @param {string} prdContent - PRD content
  * @param {string} prdPath - Path to the PRD file
  * @param {number} numTasks - Number of tasks to generate
  * @param {number} retryCount - Retry count
- * @returns {Object} Claude's response
+ * @returns {Object} Ollama's response
  */
 async function callClaude(prdContent, prdPath, numTasks, retryCount = 0) {
   try {
-    log('info', 'Calling Claude...');
+    log('info', 'Calling Ollama...');
     
     // Build the system prompt
     const systemPrompt = `You are an AI assistant helping to break down a Product Requirements Document (PRD) into a set of sequential development tasks. 
@@ -139,13 +190,13 @@ Important: Your response must be valid JSON only, with no additional explanation
     return await handleStreamingRequest(prdContent, prdPath, numTasks, CONFIG.maxTokens, systemPrompt);
   } catch (error) {
     // Get user-friendly error message
-    const userMessage = handleClaudeError(error);
+    const userMessage = handleOllamaError(error);
     log('error', userMessage);
 
     // Retry logic for certain errors
     if (retryCount < 2 && (
-      error.error?.type === 'overloaded_error' || 
-      error.error?.type === 'rate_limit_error' ||
+      error.code === 'ECONNREFUSED' || 
+      error.code === 'ENOTFOUND' ||
       error.message?.toLowerCase().includes('timeout') ||
       error.message?.toLowerCase().includes('network')
     )) {
@@ -164,13 +215,13 @@ Important: Your response must be valid JSON only, with no additional explanation
 }
 
 /**
- * Handle streaming request to Claude
+ * Handle streaming request to Ollama
  * @param {string} prdContent - PRD content
  * @param {string} prdPath - Path to the PRD file
  * @param {number} numTasks - Number of tasks to generate
  * @param {number} maxTokens - Maximum tokens
  * @param {string} systemPrompt - System prompt
- * @returns {Object} Claude's response
+ * @returns {Object} Ollama's response
  */
 async function handleStreamingRequest(prdContent, prdPath, numTasks, maxTokens, systemPrompt) {
   const loadingIndicator = startLoadingIndicator('Generating tasks from PRD...');
@@ -179,139 +230,273 @@ async function handleStreamingRequest(prdContent, prdPath, numTasks, maxTokens, 
   
   try {
     // Use streaming for handling large responses
-    const stream = await anthropic.messages.create({
-      model: CONFIG.model,
-      max_tokens: maxTokens,
-      temperature: CONFIG.temperature,
-      system: systemPrompt,
-      messages: [
-        {
-          role: 'user',
-          content: `Here's the Product Requirements Document (PRD) to break down into ${numTasks} tasks:\n\n${prdContent}`
-        }
-      ],
-      stream: true
+    const response = await fetch(`${OLLAMA_API_URL}/api/chat`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: OLLAMA_MODEL,
+        messages: [
+          {
+            role: 'system',
+            content: systemPrompt
+          },
+          {
+            role: 'user',
+            content: `Here's the Product Requirements Document (PRD) to break down into ${numTasks} tasks:\n\n${prdContent}`
+          }
+        ],
+        stream: true
+      })
     });
+    
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      throw { 
+        status: response.status, 
+        message: error.error || `HTTP error ${response.status}` 
+      };
+    }
     
     // Update loading indicator to show streaming progress
     let dotCount = 0;
     const readline = await import('readline');
     streamingInterval = setInterval(() => {
       readline.cursorTo(process.stdout, 0);
-      process.stdout.write(`Receiving streaming response from Claude${'.'.repeat(dotCount)}`);
+      process.stdout.write(`Generating tasks from PRD${'.'.repeat(dotCount)}`);
       dotCount = (dotCount + 1) % 4;
     }, 500);
     
     // Process the stream
-    for await (const chunk of stream) {
-      if (chunk.type === 'content_block_delta' && chunk.delta.text) {
-        responseText += chunk.delta.text;
+    if (typeof response.body.getReader !== 'function') {
+      // Handle node-fetch response body format
+      const chunks = [];
+      response.body.on('data', chunk => chunks.push(chunk));
+      
+      await new Promise((resolve, reject) => {
+        response.body.on('end', () => resolve());
+        response.body.on('error', err => reject(err));
+      });
+      
+      const responseBuffer = Buffer.concat(chunks);
+      const responseString = responseBuffer.toString('utf-8');
+      
+      // Save raw response for debugging
+      if (CONFIG.debug) {
+        log('debug', `Raw Ollama response (first 500 chars): ${responseString.substring(0, 500)}`);
+        
+        // Write to file for complete examination
+        const fs = await import('fs');
+        fs.promises.writeFile('ollama_response_debug.txt', responseString);
+        log('debug', 'Full response written to ollama_response_debug.txt');
+      }
+      
+      // Parse the response lines - concatenate the content instead of adding it directly
+      const lines = responseString.split('\n').filter(line => line.trim());
+      
+      for (const line of lines) {
+        try {
+          const data = JSON.parse(line);
+          if (data.message && data.message.content) {
+            responseText += data.message.content;
+          }
+        } catch (e) {
+          // Skip invalid JSON
+          if (CONFIG.debug) {
+            log('debug', `Error parsing JSON line: ${e.message}, Line: ${line}`);
+          }
+        }
+      }
+    } else {
+      // Handle browser-like response body format with getReader
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      
+      let fullResponse = '';  // Store the full response for debugging
+      
+      let done = false;
+      while (!done) {
+        const { value, done: doneReading } = await reader.read();
+        done = doneReading;
+        
+        if (value) {
+          const chunk = decoder.decode(value, { stream: true });
+          fullResponse += chunk;  // Add to full response
+          
+          try {
+            // Ollama returns each chunk as a JSON object with a "message" field
+            const lines = chunk.split('\n').filter(line => line.trim());
+            
+            for (const line of lines) {
+              try {
+                const data = JSON.parse(line);
+                if (data.message && data.message.content) {
+                  responseText += data.message.content;
+                }
+              } catch (e) {
+                // Skip invalid JSON
+                if (CONFIG.debug) {
+                  log('debug', `Error parsing JSON: ${e.message}, Line: ${line}`);
+                }
+              }
+            }
+          } catch (e) {
+            // If parsing fails, just append the raw chunk
+            responseText += chunk;
+          }
+        }
+      }
+      
+      // Save raw response for debugging
+      if (CONFIG.debug) {
+        log('debug', `Raw Ollama response (first 500 chars): ${fullResponse.substring(0, 500)}`);
+        
+        // Write to file for complete examination
+        const fs = await import('fs');
+        fs.promises.writeFile('ollama_response_debug.txt', fullResponse);
+        log('debug', 'Full response written to ollama_response_debug.txt');
       }
     }
     
     if (streamingInterval) clearInterval(streamingInterval);
     stopLoadingIndicator(loadingIndicator);
     
-    log('info', "Completed streaming response from Claude API!");
+    log('info', 'Response received, processing...');
     
-    return processClaudeResponse(responseText, numTasks, 0, prdContent, prdPath);
-  } catch (error) {
-    if (streamingInterval) clearInterval(streamingInterval);
-    stopLoadingIndicator(loadingIndicator);
+    // Process the raw response text to fix JSON escaping issues
+    const processedText = processOllamaResponse(responseText);
     
-    // Get user-friendly error message
-    const userMessage = handleClaudeError(error);
-    log('error', userMessage);
-    console.error(chalk.red(userMessage));
-    
+    // Write accumulated responseText to a debug file
     if (CONFIG.debug) {
-      log('debug', 'Full error:', error);
+      const fs = await import('fs');
+      fs.promises.writeFile('ollama_accumulated_debug.txt', responseText);
+      fs.promises.writeFile('ollama_processed_debug.txt', processedText);
+      log('debug', 'Accumulated response written to ollama_accumulated_debug.txt');
+      log('debug', 'Processed response written to ollama_processed_debug.txt');
+      log('debug', `Accumulated response (first 500 chars): ${responseText.substring(0, 500)}`);
+      log('debug', `Processed response (first 500 chars): ${processedText.substring(0, 500)}`);
     }
     
-    throw new Error(userMessage);
-  }
-}
-
-/**
- * Process Claude's response
- * @param {string} textContent - Text content from Claude
- * @param {number} numTasks - Number of tasks
- * @param {number} retryCount - Retry count
- * @param {string} prdContent - PRD content
- * @param {string} prdPath - Path to the PRD file
- * @returns {Object} Processed response
- */
-function processClaudeResponse(textContent, numTasks, retryCount, prdContent, prdPath) {
-  try {
-    // Attempt to parse the JSON response
-    let jsonStart = textContent.indexOf('{');
-    let jsonEnd = textContent.lastIndexOf('}');
-    
-    if (jsonStart === -1 || jsonEnd === -1) {
-      throw new Error("Could not find valid JSON in Claude's response");
-    }
-    
-    let jsonContent = textContent.substring(jsonStart, jsonEnd + 1);
-    let parsedData = JSON.parse(jsonContent);
-    
-    // Validate the structure of the generated tasks
-    if (!parsedData.tasks || !Array.isArray(parsedData.tasks)) {
-      throw new Error("Claude's response does not contain a valid tasks array");
-    }
-    
-    // Ensure we have the correct number of tasks
-    if (parsedData.tasks.length !== numTasks) {
-      log('warn', `Expected ${numTasks} tasks, but received ${parsedData.tasks.length}`);
-    }
-    
-    // Add metadata if missing
-    if (!parsedData.metadata) {
-      parsedData.metadata = {
-        projectName: "PRD Implementation",
-        totalTasks: parsedData.tasks.length,
-        sourceFile: prdPath,
-        generatedAt: new Date().toISOString().split('T')[0]
+    try {
+      // Parse the response JSON
+      // First try to parse as-is
+      try {
+        const jsonResponse = JSON.parse(processedText);
+        return jsonResponse;
+      } catch (e) {
+        log('debug', `Failed to parse response as JSON: ${e.message}`);
+        
+        // Not valid JSON, try to extract JSON
+        const jsonStart = processedText.indexOf('{');
+        const jsonEnd = processedText.lastIndexOf('}');
+        
+        log('debug', `JSON start index: ${jsonStart}, JSON end index: ${jsonEnd}`);
+        
+        if (jsonStart >= 0 && jsonEnd >= 0 && jsonEnd > jsonStart) {
+          const jsonText = processedText.substring(jsonStart, jsonEnd + 1);
+          log('debug', `Extracted JSON (first 500 chars): ${jsonText.substring(0, 500)}`);
+          
+          try {
+            const extractedJson = JSON.parse(jsonText);
+            return extractedJson;
+          } catch (e) {
+            // Couldn't parse extracted JSON either
+            log('debug', `Failed to parse extracted JSON: ${e.message}`);
+            
+            // Create a basic valid response to return instead of failing
+            log('warn', 'Creating fallback tasks structure');
+            return {
+              tasks: Array.from({ length: numTasks }, (_, i) => ({
+                id: i + 1,
+                title: `Task ${i + 1}`,
+                description: `Auto-generated fallback task ${i + 1}`,
+                status: 'pending',
+                dependencies: [],
+                priority: 'medium',
+                details: 'This task was auto-generated due to parsing issues with the AI response.',
+                testStrategy: 'Manual verification'
+              })),
+              metadata: {
+                projectName: process.env.PROJECT_NAME || "Task Master Project",
+                totalTasks: numTasks,
+                sourceFile: prdPath,
+                generatedAt: new Date().toISOString().split('T')[0],
+                note: "Tasks were generated as fallbacks due to AI response parsing issues."
+              }
+            };
+          }
+        } else {
+          // Create a fallback tasks structure if no JSON can be extracted
+          log('warn', 'Creating fallback tasks structure due to missing JSON markers');
+          return {
+            tasks: Array.from({ length: numTasks }, (_, i) => ({
+              id: i + 1,
+              title: `Task ${i + 1}`,
+              description: `Auto-generated fallback task ${i + 1}`,
+              status: 'pending',
+              dependencies: [],
+              priority: 'medium',
+              details: 'This task was auto-generated due to parsing issues with the AI response.',
+              testStrategy: 'Manual verification'
+            })),
+            metadata: {
+              projectName: process.env.PROJECT_NAME || "Task Master Project",
+              totalTasks: numTasks,
+              sourceFile: prdPath,
+              generatedAt: new Date().toISOString().split('T')[0],
+              note: "Tasks were generated as fallbacks due to AI response parsing issues."
+            }
+          };
+        }
+      }
+    } catch (e) {
+      log('error', `Error parsing Ollama response: ${e.message}`);
+      
+      // Create a fallback tasks structure in case of error
+      log('warn', 'Creating fallback tasks structure due to parsing error');
+      return {
+        tasks: Array.from({ length: numTasks }, (_, i) => ({
+          id: i + 1,
+          title: `Task ${i + 1}`,
+          description: `Auto-generated fallback task ${i + 1}`,
+          status: 'pending',
+          dependencies: [],
+          priority: 'medium',
+          details: 'This task was auto-generated due to parsing issues with the AI response.',
+          testStrategy: 'Manual verification'
+        })),
+        metadata: {
+          projectName: process.env.PROJECT_NAME || "Task Master Project",
+          totalTasks: numTasks,
+          sourceFile: prdPath,
+          generatedAt: new Date().toISOString().split('T')[0],
+          note: "Tasks were generated as fallbacks due to error: " + e.message
+        }
       };
     }
-    
-    return parsedData;
   } catch (error) {
-    log('error', "Error processing Claude's response:", error.message);
-    
-    // Retry logic
-    if (retryCount < 2) {
-      log('info', `Retrying to parse response (${retryCount + 1}/2)...`);
-      
-      // Try again with Claude for a cleaner response
-      if (retryCount === 1) {
-        log('info', "Calling Claude again for a cleaner response...");
-        return callClaude(prdContent, prdPath, numTasks, retryCount + 1);
-      }
-      
-      return processClaudeResponse(textContent, numTasks, retryCount + 1, prdContent, prdPath);
-    } else {
-      throw error;
-    }
+    if (streamingInterval) clearInterval(streamingInterval);
+    stopLoadingIndicator(loadingIndicator);
+    throw error;
   }
 }
 
 /**
  * Generate subtasks for a task
- * @param {Object} task - Task to generate subtasks for
+ * @param {Object} task - Task object
  * @param {number} numSubtasks - Number of subtasks to generate
- * @param {number} nextSubtaskId - Next subtask ID
+ * @param {number} nextSubtaskId - Starting subtask ID
  * @param {string} additionalContext - Additional context
  * @returns {Array} Generated subtasks
  */
-async function generateSubtasks(task, numSubtasks, nextSubtaskId, additionalContext = '') {
+async function generateSubtasks(task, numSubtasks = 3, nextSubtaskId = 1, additionalContext = '') {
   try {
-    log('info', `Generating ${numSubtasks} subtasks for task ${task.id}: ${task.title}`);
-    
-    const loadingIndicator = startLoadingIndicator(`Generating subtasks for task ${task.id}...`);
+    const loadingIndicator = startLoadingIndicator(`Generating ${numSubtasks} subtasks for task ${task.id}: ${task.title}`);
     let streamingInterval = null;
     let responseText = '';
     
-    const systemPrompt = `You are an AI assistant helping with task breakdown for software development. 
+    const systemPrompt = `You are an AI assistant helping with task breakdown for software development.
 You need to break down a high-level task into ${numSubtasks} specific subtasks that can be implemented one by one.
 
 Subtasks should:
@@ -330,16 +515,14 @@ For each subtask, provide:
 
 Each subtask should be implementable in a focused coding session.`;
 
-    const contextPrompt = additionalContext ? 
-      `\n\nAdditional context to consider: ${additionalContext}` : '';
-    
     const userPrompt = `Please break down this task into ${numSubtasks} specific, actionable subtasks:
 
 Task ID: ${task.id}
 Title: ${task.title}
 Description: ${task.description}
 Current details: ${task.details || 'None provided'}
-${contextPrompt}
+
+${additionalContext ? 'Additional context: ' + additionalContext : ''}
 
 Return exactly ${numSubtasks} subtasks with the following JSON structure:
 [
@@ -366,24 +549,109 @@ Note on dependencies: Subtasks can depend on other subtasks with lower IDs. Use 
       }, 500);
       
       // Use streaming API call
-      const stream = await anthropic.messages.create({
-        model: CONFIG.model,
-        max_tokens: CONFIG.maxTokens,
-        temperature: CONFIG.temperature,
-        system: systemPrompt,
-        messages: [
-          {
-            role: 'user',
-            content: userPrompt
-          }
-        ],
-        stream: true
+      const response = await fetch(`${OLLAMA_API_URL}/api/chat`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          model: OLLAMA_MODEL,
+          messages: [
+            {
+              role: 'system',
+              content: systemPrompt
+            },
+            {
+              role: 'user',
+              content: userPrompt
+            }
+          ],
+          stream: true
+        })
       });
       
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({}));
+        throw { 
+          status: response.status, 
+          message: error.error || `HTTP error ${response.status}` 
+        };
+      }
+      
       // Process the stream
-      for await (const chunk of stream) {
-        if (chunk.type === 'content_block_delta' && chunk.delta.text) {
-          responseText += chunk.delta.text;
+      if (typeof response.body.getReader !== 'function') {
+        // Handle node-fetch response body format
+        const chunks = [];
+        response.body.on('data', chunk => chunks.push(chunk));
+        
+        await new Promise((resolve, reject) => {
+          response.body.on('end', () => resolve());
+          response.body.on('error', err => reject(err));
+        });
+        
+        const responseBuffer = Buffer.concat(chunks);
+        const responseString = responseBuffer.toString('utf-8');
+        
+        // Save raw response for debugging
+        if (CONFIG.debug) {
+          log('debug', `Raw subtask response (first 500 chars): ${responseString.substring(0, 500)}`);
+          
+          // Write to file for complete examination
+          const fs = await import('fs');
+          fs.promises.writeFile('ollama_subtask_debug.txt', responseString);
+          log('debug', 'Full subtask response written to ollama_subtask_debug.txt');
+        }
+        
+        // Parse the response lines
+        const lines = responseString.split('\n').filter(line => line.trim());
+        
+        for (const line of lines) {
+          try {
+            const data = JSON.parse(line);
+            if (data.message && data.message.content) {
+              responseText += data.message.content;
+            }
+          } catch (e) {
+            // Skip invalid JSON
+            if (CONFIG.debug) {
+              log('debug', `Error parsing JSON line: ${e.message}, Line: ${line}`);
+            }
+          }
+        }
+      } else {
+        // Handle browser-like response body format with getReader
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        
+        let done = false;
+        while (!done) {
+          const { value, done: doneReading } = await reader.read();
+          done = doneReading;
+          
+          if (value) {
+            const chunk = decoder.decode(value, { stream: true });
+            try {
+              // Ollama returns each chunk as a JSON object with a "message" field
+              const lines = chunk.split('\n').filter(line => line.trim());
+              
+              for (const line of lines) {
+                try {
+                  const data = JSON.parse(line);
+                  if (data.message && data.message.content) {
+                    responseText += data.message.content;
+                  }
+                } catch (e) {
+                  // Skip invalid JSON
+                  if (CONFIG.debug) {
+                    log('debug', `Error parsing JSON: ${e.message}, Line: ${line}`);
+                  }
+                }
+              }
+            } catch (e) {
+              // If parsing fails, just append the raw chunk
+              responseText += chunk;
+            }
+          }
         }
       }
       
@@ -392,7 +660,19 @@ Note on dependencies: Subtasks can depend on other subtasks with lower IDs. Use 
       
       log('info', `Completed generating subtasks for task ${task.id}`);
       
-      return parseSubtasksFromText(responseText, nextSubtaskId, numSubtasks, task.id);
+      // Process the response text to fix JSON escaping issues
+      const processedText = processOllamaResponse(responseText);
+      
+      // Write accumulated responseText to a debug file
+      if (CONFIG.debug) {
+        const fs = await import('fs');
+        fs.promises.writeFile('ollama_subtasks_accumulated_debug.txt', responseText);
+        fs.promises.writeFile('ollama_subtasks_processed_debug.txt', processedText);
+        log('debug', 'Accumulated subtasks response written to ollama_subtasks_accumulated_debug.txt');
+        log('debug', 'Processed subtasks response written to ollama_subtasks_processed_debug.txt');
+      }
+      
+      return parseSubtasksFromText(processedText, nextSubtaskId, numSubtasks, task.id);
     } catch (error) {
       if (streamingInterval) clearInterval(streamingInterval);
       stopLoadingIndicator(loadingIndicator);
@@ -405,10 +685,10 @@ Note on dependencies: Subtasks can depend on other subtasks with lower IDs. Use 
 }
 
 /**
- * Generate subtasks with research from Perplexity
- * @param {Object} task - Task to generate subtasks for
+ * Generate subtasks with Perplexity research
+ * @param {Object} task - Task object
  * @param {number} numSubtasks - Number of subtasks to generate
- * @param {number} nextSubtaskId - Next subtask ID
+ * @param {number} nextSubtaskId - Starting subtask ID
  * @param {string} additionalContext - Additional context
  * @returns {Array} Generated subtasks
  */
@@ -416,9 +696,6 @@ async function generateSubtasksWithPerplexity(task, numSubtasks = 3, nextSubtask
   try {
     // First, perform research to get context
     log('info', `Researching context for task ${task.id}: ${task.title}`);
-    const perplexityClient = getPerplexityClient();
-    
-    const PERPLEXITY_MODEL = process.env.PERPLEXITY_MODEL || 'sonar-pro';
     const researchLoadingIndicator = startLoadingIndicator('Researching best practices with Perplexity AI...');
     
     // Formulate research query based on task
@@ -426,22 +703,13 @@ async function generateSubtasksWithPerplexity(task, numSubtasks = 3, nextSubtask
 What are current best practices, libraries, design patterns, and implementation approaches? 
 Include concrete code examples and technical considerations where relevant.`;
     
-    // Query Perplexity for research
-    const researchResponse = await perplexityClient.chat.completions.create({
-      model: PERPLEXITY_MODEL,
-      messages: [{
-        role: 'user',
-        content: researchQuery
-      }],
-      temperature: 0.1 // Lower temperature for more factual responses
-    });
-    
-    const researchResult = researchResponse.choices[0].message.content;
+    // Query Perplexity for research using the new function
+    const researchResult = await getPerplexityResearch(researchQuery);
     
     stopLoadingIndicator(researchLoadingIndicator);
     log('info', 'Research completed, now generating subtasks with additional context');
     
-    // Use the research result as additional context for Claude to generate subtasks
+    // Use the research result as additional context for Ollama to generate subtasks
     const combinedContext = `
 RESEARCH FINDINGS:
 ${researchResult}
@@ -450,7 +718,7 @@ ADDITIONAL CONTEXT PROVIDED BY USER:
 ${additionalContext || "No additional context provided."}
 `;
     
-    // Now generate subtasks with Claude
+    // Now generate subtasks with Ollama
     const loadingIndicator = startLoadingIndicator(`Generating research-backed subtasks for task ${task.id}...`);
     let streamingInterval = null;
     let responseText = '';
@@ -511,24 +779,67 @@ Note on dependencies: Subtasks can depend on other subtasks with lower IDs. Use 
       }, 500);
       
       // Use streaming API call
-      const stream = await anthropic.messages.create({
-        model: CONFIG.model,
-        max_tokens: CONFIG.maxTokens,
-        temperature: CONFIG.temperature,
-        system: systemPrompt,
-        messages: [
-          {
-            role: 'user',
-            content: userPrompt
-          }
-        ],
-        stream: true
+      const response = await fetch(`${OLLAMA_API_URL}/api/chat`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          model: OLLAMA_MODEL,
+          messages: [
+            {
+              role: 'system',
+              content: systemPrompt
+            },
+            {
+              role: 'user',
+              content: userPrompt
+            }
+          ],
+          stream: true
+        })
       });
       
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({}));
+        throw { 
+          status: response.status, 
+          message: error.error || `HTTP error ${response.status}` 
+        };
+      }
+      
       // Process the stream
-      for await (const chunk of stream) {
-        if (chunk.type === 'content_block_delta' && chunk.delta.text) {
-          responseText += chunk.delta.text;
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      
+      let done = false;
+      while (!done) {
+        const { value, done: doneReading } = await reader.read();
+        done = doneReading;
+        
+        if (value) {
+          const chunk = decoder.decode(value, { stream: true });
+          try {
+            // Ollama returns each chunk as a JSON object with a "message" field
+            const lines = chunk.split('\n').filter(line => line.trim());
+            
+            for (const line of lines) {
+              try {
+                const data = JSON.parse(line);
+                if (data.message && data.message.content) {
+                  responseText += data.message.content;
+                }
+              } catch (e) {
+                // Skip invalid JSON
+                if (CONFIG.debug) {
+                  log('debug', `Error parsing JSON: ${e.message}, Line: ${line}`);
+                }
+              }
+            }
+          } catch (e) {
+            // If parsing fails, just append the raw chunk
+            responseText += chunk;
+          }
         }
       }
       
@@ -550,7 +861,7 @@ Note on dependencies: Subtasks can depend on other subtasks with lower IDs. Use 
 }
 
 /**
- * Parse subtasks from Claude's response text
+ * Parse subtasks from Ollama's response text
  * @param {string} text - Response text
  * @param {number} startId - Starting subtask ID
  * @param {number} expectedCount - Expected number of subtasks
@@ -671,10 +982,9 @@ export {
   getPerplexityClient,
   callClaude,
   handleStreamingRequest,
-  processClaudeResponse,
   generateSubtasks,
   generateSubtasksWithPerplexity,
   parseSubtasksFromText,
   generateComplexityAnalysisPrompt,
-  handleClaudeError
+  handleOllamaError
 }; 

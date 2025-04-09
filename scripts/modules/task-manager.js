@@ -9,7 +9,7 @@ import chalk from 'chalk';
 import boxen from 'boxen';
 import Table from 'cli-table3';
 import readline from 'readline';
-import { Anthropic } from '@anthropic-ai/sdk';
+import fetch from 'node-fetch';
 
 import { 
   CONFIG, 
@@ -37,7 +37,8 @@ import {
   callClaude,
   generateSubtasks,
   generateSubtasksWithPerplexity,
-  generateComplexityAnalysisPrompt
+  generateComplexityAnalysisPrompt,
+  handleOllamaError
 } from './ai-services.js';
 
 import {
@@ -45,10 +46,9 @@ import {
   validateAndFixDependencies
 } from './dependency-manager.js';
 
-// Initialize Anthropic client
-const anthropic = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-});
+// Configure Ollama client settings
+const OLLAMA_API_URL = process.env.OLLAMA_API_URL || 'http://localhost:11434';
+const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'llama3';
 
 // Import perplexity if available
 let perplexity;
@@ -258,24 +258,27 @@ Return only the updated tasks as a valid JSON array.`
           }, 500);
           
           // Use streaming API call
-          const stream = await anthropic.messages.create({
-            model: CONFIG.model,
-            max_tokens: CONFIG.maxTokens,
-            temperature: CONFIG.temperature,
-            system: systemPrompt,
-            messages: [
-              {
-                role: 'user',
-                content: `Here are the tasks to update:
+          const stream = await fetch(`${OLLAMA_API_URL}/api/v1/chat/completions`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${process.env.OLLAMA_API_KEY}`
+            },
+            body: JSON.stringify({
+              model: OLLAMA_MODEL,
+              messages: [
+                { role: 'user', content: `Here are the tasks to update:
 ${taskData}
 
 Please update these tasks based on the following new context:
 ${prompt}
 
-Return only the updated tasks as a valid JSON array.`
-              }
-            ],
-            stream: true
+Return only the updated tasks as a valid JSON array.` }
+              ],
+              max_tokens: parseInt(process.env.MAX_TOKENS || CONFIG.maxTokens),
+              temperature: parseFloat(process.env.TEMPERATURE || CONFIG.temperature),
+              stream: true
+            })
           });
           
           // Process the stream
@@ -1630,13 +1633,21 @@ async function addTask(tasksPath, prompt, dependencies = [], priority = 'medium'
 
   try {
     // Call Claude with streaming enabled
-    const stream = await anthropic.messages.create({
-      max_tokens: CONFIG.maxTokens,
-      model: CONFIG.model,
-      temperature: CONFIG.temperature,
-      messages: [{ role: "user", content: userPrompt }],
-      system: systemPrompt,
-      stream: true
+    const stream = await fetch(`${OLLAMA_API_URL}/api/v1/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${process.env.OLLAMA_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: OLLAMA_MODEL,
+        messages: [
+          { role: 'user', content: userPrompt }
+        ],
+        max_tokens: parseInt(process.env.MAX_TOKENS || CONFIG.maxTokens),
+        temperature: parseFloat(process.env.TEMPERATURE || CONFIG.temperature),
+        stream: true
+      })
     });
     
     // Update loading indicator to show streaming progress
@@ -1730,529 +1741,235 @@ async function addTask(tasksPath, prompt, dependencies = [], priority = 'medium'
 }
 
 /**
- * Analyzes task complexity and generates expansion recommendations
- * @param {Object} options Command options
+ * Analyze the complexity of tasks
+ * @param {string} tasksPath - Path to the tasks file
+ * @param {string} outputPath - Path to the output file
+ * @param {string} modelOverride - Optional model override
+ * @param {boolean} useResearch - Whether to use research for analysis
  */
-async function analyzeTaskComplexity(options) {
-  const tasksPath = options.file || 'tasks/tasks.json';
-  const outputPath = options.output || 'scripts/task-complexity-report.json';
-  const modelOverride = options.model;
-  const thresholdScore = parseFloat(options.threshold || '5');
-  const useResearch = options.research || false;
-  
-  console.log(chalk.blue(`Analyzing task complexity and generating expansion recommendations...`));
-  
+async function analyzeTaskComplexity(tasksPath, outputPath, modelOverride = null, useResearch = false) {
   try {
-    // Read tasks.json
-    console.log(chalk.blue(`Reading tasks from ${tasksPath}...`));
-    const tasksData = readJSON(tasksPath);
+    log('info', `Analyzing task complexity from ${tasksPath}...`);
     
-    if (!tasksData || !tasksData.tasks || !Array.isArray(tasksData.tasks) || tasksData.tasks.length === 0) {
-      throw new Error('No tasks found in the tasks file');
+    // Validate research flag
+    if (useResearch && (!perplexity || !process.env.PERPLEXITY_API_KEY)) {
+      log('warn', 'Perplexity AI is not available. Falling back to standard complexity analysis.');
+      console.log(chalk.yellow('Perplexity AI is not available (API key may be missing). Falling back to standard complexity analysis.'));
+      useResearch = false;
     }
     
-    console.log(chalk.blue(`Found ${tasksData.tasks.length} tasks to analyze.`));
+    // Read tasks file
+    const data = readJSON(tasksPath);
+    if (!data || !data.tasks) {
+      log('error', `No valid tasks found in ${tasksPath}`);
+      process.exit(1);
+    }
     
-    // Prepare the prompt for the LLM
-    const prompt = generateComplexityAnalysisPrompt(tasksData);
+    // Generate the complexity analysis prompt
+    const prompt = generateComplexityAnalysisPrompt(data);
+    
+    // Generate task complexity analysis
+    log('info', 'Generating task complexity analysis...');
+    console.log(chalk.blue('Analyzing task complexity...'));
     
     // Start loading indicator
-    const loadingIndicator = startLoadingIndicator('Calling AI to analyze task complexity...');
-    
-    let fullResponse = '';
+    const loadingIndicator = startLoadingIndicator('Analyzing task complexity...');
     let streamingInterval = null;
     
     try {
-      // If research flag is set, use Perplexity first
+      let fullResponse = '';
+      
+      // Handle research-backed analysis if flag is enabled
       if (useResearch) {
         try {
-          console.log(chalk.blue('Using Perplexity AI for research-backed complexity analysis...'));
+          const researchResult = await researchTaskComplexity(data);
           
-          // Modify prompt to include more context for Perplexity and explicitly request JSON
-          const researchPrompt = `You are conducting a detailed analysis of software development tasks to determine their complexity and how they should be broken down into subtasks.
-
-Please research each task thoroughly, considering best practices, industry standards, and potential implementation challenges before providing your analysis.
-
-CRITICAL: You MUST respond ONLY with a valid JSON array. Do not include ANY explanatory text, markdown formatting, or code block markers.
-
-${prompt}
-
-Your response must be a clean JSON array only, following exactly this format:
-[
-  {
-    "taskId": 1,
-    "taskTitle": "Example Task",
-    "complexityScore": 7,
-    "recommendedSubtasks": 4,
-    "expansionPrompt": "Detailed prompt for expansion",
-    "reasoning": "Explanation of complexity assessment"
-  },
-  // more tasks...
-]
-
-DO NOT include any text before or after the JSON array. No explanations, no markdown formatting.`;
-          
-          const result = await perplexity.chat.completions.create({
-            model: process.env.PERPLEXITY_MODEL || 'sonar-pro',
-            messages: [
-              {
-                role: "system", 
-                content: "You are a technical analysis AI that only responds with clean, valid JSON. Never include explanatory text or markdown formatting in your response."
-              },
-              {
-                role: "user",
-                content: researchPrompt
-              }
-            ],
-            temperature: CONFIG.temperature,
-            max_tokens: CONFIG.maxTokens,
-          });
-          
-          // Extract the response text
-          fullResponse = result.choices[0].message.content;
-          console.log(chalk.green('Successfully generated complexity analysis with Perplexity AI'));
-          
-          if (streamingInterval) clearInterval(streamingInterval);
-          stopLoadingIndicator(loadingIndicator);
-          
-          // ALWAYS log the first part of the response for debugging
-          console.log(chalk.gray('Response first 200 chars:'));
-          console.log(chalk.gray(fullResponse.substring(0, 200)));
-        } catch (perplexityError) {
-          console.log(chalk.yellow('Falling back to Claude for complexity analysis...'));
-          console.log(chalk.gray('Perplexity error:'), perplexityError.message);
-          
-          // Continue to Claude as fallback
-          await useClaudeForComplexityAnalysis();
-        }
-      } else {
-        // Use Claude directly if research flag is not set
-        await useClaudeForComplexityAnalysis();
-      }
-      
-      // Helper function to use Claude for complexity analysis
-      async function useClaudeForComplexityAnalysis() {
-        // Call the LLM API with streaming
-        const stream = await anthropic.messages.create({
-          max_tokens: CONFIG.maxTokens,
-          model: modelOverride || CONFIG.model,
-          temperature: CONFIG.temperature,
-          messages: [{ role: "user", content: prompt }],
-          system: "You are an expert software architect and project manager analyzing task complexity. Respond only with valid JSON.",
-          stream: true
-        });
-        
-        // Update loading indicator to show streaming progress
-        let dotCount = 0;
-        streamingInterval = setInterval(() => {
-          readline.cursorTo(process.stdout, 0);
-          process.stdout.write(`Receiving streaming response from Claude${'.'.repeat(dotCount)}`);
-          dotCount = (dotCount + 1) % 4;
-        }, 500);
-        
-        // Process the stream
-        for await (const chunk of stream) {
-          if (chunk.type === 'content_block_delta' && chunk.delta.text) {
-            fullResponse += chunk.delta.text;
-          }
-        }
-        
-        clearInterval(streamingInterval);
-        stopLoadingIndicator(loadingIndicator);
-        
-        console.log(chalk.green("Completed streaming response from Claude API!"));
-      }
-      
-      // Parse the JSON response
-      console.log(chalk.blue(`Parsing complexity analysis...`));
-      let complexityAnalysis;
-      try {
-        // Clean up the response to ensure it's valid JSON
-        let cleanedResponse = fullResponse;
-        
-        // First check for JSON code blocks (common in markdown responses)
-        const codeBlockMatch = fullResponse.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
-        if (codeBlockMatch) {
-          cleanedResponse = codeBlockMatch[1];
-          console.log(chalk.blue("Extracted JSON from code block"));
-        } else {
-          // Look for a complete JSON array pattern
-          // This regex looks for an array of objects starting with [ and ending with ]
-          const jsonArrayMatch = fullResponse.match(/(\[\s*\{\s*"[^"]*"\s*:[\s\S]*\}\s*\])/);
-          if (jsonArrayMatch) {
-            cleanedResponse = jsonArrayMatch[1];
-            console.log(chalk.blue("Extracted JSON array pattern"));
+          if (researchResult) {
+            const combinedPrompt = `${prompt}\n\nADDITIONAL RESEARCH:\n${researchResult}\n\nUse this research to improve your assessment of task complexity and provide more accurate recommendations based on industry best practices.`;
+            
+            const complexityAnalysis = await analyzeWithOllama(combinedPrompt);
+            stopLoadingIndicator(loadingIndicator);
+            
+            // Write results to file
+            writeJSON(outputPath, complexityAnalysis);
+            
+            log('success', `Task complexity analysis saved to ${outputPath}`);
+            console.log(chalk.green(`Task complexity analysis saved to ${outputPath}`));
+            
+            return complexityAnalysis;
           } else {
-            // Try to find the start of a JSON array and capture to the end
-            const jsonStartMatch = fullResponse.match(/(\[\s*\{[\s\S]*)/);
-            if (jsonStartMatch) {
-              cleanedResponse = jsonStartMatch[1];
-              // Try to find a proper closing to the array
-              const properEndMatch = cleanedResponse.match(/([\s\S]*\}\s*\])/);
-              if (properEndMatch) {
-                cleanedResponse = properEndMatch[1];
-              }
-              console.log(chalk.blue("Extracted JSON from start of array to end"));
-            }
+            // Fall back to standard analysis
+            log('warn', 'Research did not yield useful results. Falling back to standard analysis.');
           }
+        } catch (error) {
+          log('warn', `Research-backed analysis failed: ${error.message}. Falling back to standard analysis.`);
+          console.log(chalk.yellow(`Research-backed analysis failed. Falling back to standard analysis.`));
         }
-        
-        // Log the cleaned response for debugging
-        console.log(chalk.gray("Attempting to parse cleaned JSON..."));
-        console.log(chalk.gray("Cleaned response (first 100 chars):"));
-        console.log(chalk.gray(cleanedResponse.substring(0, 100)));
-        console.log(chalk.gray("Last 100 chars:"));
-        console.log(chalk.gray(cleanedResponse.substring(cleanedResponse.length - 100)));
-        
-        // More aggressive cleaning - strip any non-JSON content at the beginning or end
-        const strictArrayMatch = cleanedResponse.match(/(\[\s*\{[\s\S]*\}\s*\])/);
-        if (strictArrayMatch) {
-          cleanedResponse = strictArrayMatch[1];
-          console.log(chalk.blue("Applied strict JSON array extraction"));
-        }
-        
-        try {
-          complexityAnalysis = JSON.parse(cleanedResponse);
-        } catch (jsonError) {
-          console.log(chalk.yellow("Initial JSON parsing failed, attempting to fix common JSON issues..."));
-          
-          // Try to fix common JSON issues
-          // 1. Remove any trailing commas in arrays or objects
-          cleanedResponse = cleanedResponse.replace(/,(\s*[\]}])/g, '$1');
-          
-          // 2. Ensure property names are double-quoted
-          cleanedResponse = cleanedResponse.replace(/(\s*)(\w+)(\s*):(\s*)/g, '$1"$2"$3:$4');
-          
-          // 3. Replace single quotes with double quotes for property values
-          cleanedResponse = cleanedResponse.replace(/:(\s*)'([^']*)'(\s*[,}])/g, ':$1"$2"$3');
-          
-          // 4. Fix unterminated strings - common with LLM responses
-          const untermStringPattern = /:(\s*)"([^"]*)(?=[,}])/g;
-          cleanedResponse = cleanedResponse.replace(untermStringPattern, ':$1"$2"');
-          
-          // 5. Fix multi-line strings by replacing newlines
-          cleanedResponse = cleanedResponse.replace(/:(\s*)"([^"]*)\n([^"]*)"/g, ':$1"$2 $3"');
-          
-          try {
-            complexityAnalysis = JSON.parse(cleanedResponse);
-            console.log(chalk.green("Successfully parsed JSON after fixing common issues"));
-          } catch (fixedJsonError) {
-            console.log(chalk.red("Failed to parse JSON even after fixes, attempting more aggressive cleanup..."));
-            
-            // Try to extract and process each task individually
-            try {
-              const taskMatches = cleanedResponse.match(/\{\s*"taskId"\s*:\s*(\d+)[^}]*\}/g);
-              if (taskMatches && taskMatches.length > 0) {
-                console.log(chalk.yellow(`Found ${taskMatches.length} task objects, attempting to process individually`));
-                
-                complexityAnalysis = [];
-                for (const taskMatch of taskMatches) {
-                  try {
-                    // Try to parse each task object individually
-                    const fixedTask = taskMatch.replace(/,\s*$/, ''); // Remove trailing commas
-                    const taskObj = JSON.parse(`${fixedTask}`);
-                    if (taskObj && taskObj.taskId) {
-                      complexityAnalysis.push(taskObj);
-                    }
-                  } catch (taskParseError) {
-                    console.log(chalk.yellow(`Could not parse individual task: ${taskMatch.substring(0, 30)}...`));
-                  }
-                }
-                
-                if (complexityAnalysis.length > 0) {
-                  console.log(chalk.green(`Successfully parsed ${complexityAnalysis.length} tasks individually`));
-                } else {
-                  throw new Error("Could not parse any tasks individually");
-                }
-              } else {
-                throw fixedJsonError;
-              }
-            } catch (individualError) {
-              console.log(chalk.red("All parsing attempts failed"));
-              throw jsonError; // throw the original error
-            }
-          }
-        }
-        
-        // Ensure complexityAnalysis is an array
-        if (!Array.isArray(complexityAnalysis)) {
-          console.log(chalk.yellow('Response is not an array, checking if it contains an array property...'));
-          
-          // Handle the case where the response might be an object with an array property
-          if (complexityAnalysis.tasks || complexityAnalysis.analysis || complexityAnalysis.results) {
-            complexityAnalysis = complexityAnalysis.tasks || complexityAnalysis.analysis || complexityAnalysis.results;
-          } else {
-            // If no recognizable array property, wrap it as an array if it's an object
-            if (typeof complexityAnalysis === 'object' && complexityAnalysis !== null) {
-              console.log(chalk.yellow('Converting object to array...'));
-              complexityAnalysis = [complexityAnalysis];
-            } else {
-              throw new Error('Response does not contain a valid array or object');
-            }
-          }
-        }
-        
-        // Final check to ensure we have an array
-        if (!Array.isArray(complexityAnalysis)) {
-          throw new Error('Failed to extract an array from the response');
-        }
-        
-        // Check that we have an analysis for each task in the input file
-        const taskIds = tasksData.tasks.map(t => t.id);
-        const analysisTaskIds = complexityAnalysis.map(a => a.taskId);
-        const missingTaskIds = taskIds.filter(id => !analysisTaskIds.includes(id));
-
-        if (missingTaskIds.length > 0) {
-          console.log(chalk.yellow(`Missing analysis for ${missingTaskIds.length} tasks: ${missingTaskIds.join(', ')}`));
-          console.log(chalk.blue(`Attempting to analyze missing tasks...`));
-          
-          // Create a subset of tasksData with just the missing tasks
-          const missingTasks = {
-            meta: tasksData.meta,
-            tasks: tasksData.tasks.filter(t => missingTaskIds.includes(t.id))
-          };
-          
-          // Generate a prompt for just the missing tasks
-          const missingTasksPrompt = generateComplexityAnalysisPrompt(missingTasks);
-          
-          // Call the same AI model to analyze the missing tasks
-          let missingAnalysisResponse = '';
-          
-          try {
-            // Start a new loading indicator
-            const missingTasksLoadingIndicator = startLoadingIndicator('Analyzing missing tasks...');
-            
-            // Use the same AI model as the original analysis
-            if (useResearch) {
-              // Create the same research prompt but for missing tasks
-              const missingTasksResearchPrompt = `You are conducting a detailed analysis of software development tasks to determine their complexity and how they should be broken down into subtasks.
-
-Please research each task thoroughly, considering best practices, industry standards, and potential implementation challenges before providing your analysis.
-
-CRITICAL: You MUST respond ONLY with a valid JSON array. Do not include ANY explanatory text, markdown formatting, or code block markers.
-
-${missingTasksPrompt}
-
-Your response must be a clean JSON array only, following exactly this format:
-[
-  {
-    "taskId": 1,
-    "taskTitle": "Example Task",
-    "complexityScore": 7,
-    "recommendedSubtasks": 4,
-    "expansionPrompt": "Detailed prompt for expansion",
-    "reasoning": "Explanation of complexity assessment"
-  },
-  // more tasks...
-]
-
-DO NOT include any text before or after the JSON array. No explanations, no markdown formatting.`;
-
-              const result = await perplexity.chat.completions.create({
-                model: process.env.PERPLEXITY_MODEL || 'sonar-pro',
-                messages: [
-                  {
-                    role: "system", 
-                    content: "You are a technical analysis AI that only responds with clean, valid JSON. Never include explanatory text or markdown formatting in your response."
-                  },
-                  {
-                    role: "user",
-                    content: missingTasksResearchPrompt
-                  }
-                ],
-                temperature: CONFIG.temperature,
-                max_tokens: CONFIG.maxTokens,
-              });
-              
-              // Extract the response
-              missingAnalysisResponse = result.choices[0].message.content;
-            } else {
-              // Use Claude
-              const stream = await anthropic.messages.create({
-                max_tokens: CONFIG.maxTokens,
-                model: modelOverride || CONFIG.model,
-                temperature: CONFIG.temperature,
-                messages: [{ role: "user", content: missingTasksPrompt }],
-                system: "You are an expert software architect and project manager analyzing task complexity. Respond only with valid JSON.",
-                stream: true
-              });
-              
-              // Process the stream
-              for await (const chunk of stream) {
-                if (chunk.type === 'content_block_delta' && chunk.delta.text) {
-                  missingAnalysisResponse += chunk.delta.text;
-                }
-              }
-            }
-            
-            // Stop the loading indicator
-            stopLoadingIndicator(missingTasksLoadingIndicator);
-            
-            // Parse the response using the same parsing logic as before
-            let missingAnalysis;
-            try {
-              // Clean up the response to ensure it's valid JSON (using same logic as above)
-              let cleanedResponse = missingAnalysisResponse;
-              
-              // Use the same JSON extraction logic as before
-              // ... (code omitted for brevity, it would be the same as the original parsing)
-              
-              // First check for JSON code blocks
-              const codeBlockMatch = missingAnalysisResponse.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
-              if (codeBlockMatch) {
-                cleanedResponse = codeBlockMatch[1];
-                console.log(chalk.blue("Extracted JSON from code block for missing tasks"));
-              } else {
-                // Look for a complete JSON array pattern
-                const jsonArrayMatch = missingAnalysisResponse.match(/(\[\s*\{\s*"[^"]*"\s*:[\s\S]*\}\s*\])/);
-                if (jsonArrayMatch) {
-                  cleanedResponse = jsonArrayMatch[1];
-                  console.log(chalk.blue("Extracted JSON array pattern for missing tasks"));
-                } else {
-                  // Try to find the start of a JSON array and capture to the end
-                  const jsonStartMatch = missingAnalysisResponse.match(/(\[\s*\{[\s\S]*)/);
-                  if (jsonStartMatch) {
-                    cleanedResponse = jsonStartMatch[1];
-                    // Try to find a proper closing to the array
-                    const properEndMatch = cleanedResponse.match(/([\s\S]*\}\s*\])/);
-                    if (properEndMatch) {
-                      cleanedResponse = properEndMatch[1];
-                    }
-                    console.log(chalk.blue("Extracted JSON from start of array to end for missing tasks"));
-                  }
-                }
-              }
-              
-              // More aggressive cleaning if needed
-              const strictArrayMatch = cleanedResponse.match(/(\[\s*\{[\s\S]*\}\s*\])/);
-              if (strictArrayMatch) {
-                cleanedResponse = strictArrayMatch[1];
-                console.log(chalk.blue("Applied strict JSON array extraction for missing tasks"));
-              }
-              
-              try {
-                missingAnalysis = JSON.parse(cleanedResponse);
-              } catch (jsonError) {
-                // Try to fix common JSON issues (same as before)
-                cleanedResponse = cleanedResponse.replace(/,(\s*[\]}])/g, '$1');
-                cleanedResponse = cleanedResponse.replace(/(\s*)(\w+)(\s*):(\s*)/g, '$1"$2"$3:$4');
-                cleanedResponse = cleanedResponse.replace(/:(\s*)'([^']*)'(\s*[,}])/g, ':$1"$2"$3');
-                
-                try {
-                  missingAnalysis = JSON.parse(cleanedResponse);
-                  console.log(chalk.green("Successfully parsed JSON for missing tasks after fixing common issues"));
-                } catch (fixedJsonError) {
-                  // Try the individual task extraction as a last resort
-                  console.log(chalk.red("Failed to parse JSON for missing tasks, attempting individual extraction..."));
-                  
-                  const taskMatches = cleanedResponse.match(/\{\s*"taskId"\s*:\s*(\d+)[^}]*\}/g);
-                  if (taskMatches && taskMatches.length > 0) {
-                    console.log(chalk.yellow(`Found ${taskMatches.length} task objects, attempting to process individually`));
-                    
-                    missingAnalysis = [];
-                    for (const taskMatch of taskMatches) {
-                      try {
-                        const fixedTask = taskMatch.replace(/,\s*$/, '');
-                        const taskObj = JSON.parse(`${fixedTask}`);
-                        if (taskObj && taskObj.taskId) {
-                          missingAnalysis.push(taskObj);
-                        }
-                      } catch (taskParseError) {
-                        console.log(chalk.yellow(`Could not parse individual task: ${taskMatch.substring(0, 30)}...`));
-                      }
-                    }
-                    
-                    if (missingAnalysis.length === 0) {
-                      throw new Error("Could not parse any missing tasks");
-                    }
-                  } else {
-                    throw fixedJsonError;
-                  }
-                }
-              }
-              
-              // Ensure it's an array
-              if (!Array.isArray(missingAnalysis)) {
-                if (missingAnalysis && typeof missingAnalysis === 'object') {
-                  missingAnalysis = [missingAnalysis];
-                } else {
-                  throw new Error("Missing tasks analysis is not an array or object");
-                }
-              }
-              
-              // Add the missing analyses to the main analysis array
-              console.log(chalk.green(`Successfully analyzed ${missingAnalysis.length} missing tasks`));
-              complexityAnalysis = [...complexityAnalysis, ...missingAnalysis];
-              
-              // Re-check for missing tasks
-              const updatedAnalysisTaskIds = complexityAnalysis.map(a => a.taskId);
-              const stillMissingTaskIds = taskIds.filter(id => !updatedAnalysisTaskIds.includes(id));
-              
-              if (stillMissingTaskIds.length > 0) {
-                console.log(chalk.yellow(`Warning: Still missing analysis for ${stillMissingTaskIds.length} tasks: ${stillMissingTaskIds.join(', ')}`));
-              } else {
-                console.log(chalk.green(`All tasks now have complexity analysis!`));
-              }
-            } catch (error) {
-              console.error(chalk.red(`Error analyzing missing tasks: ${error.message}`));
-              console.log(chalk.yellow(`Continuing with partial analysis...`));
-            }
-          } catch (error) {
-            console.error(chalk.red(`Error during retry for missing tasks: ${error.message}`));
-            console.log(chalk.yellow(`Continuing with partial analysis...`));
-          }
-        }
-      } catch (error) {
-        console.error(chalk.red(`Failed to parse LLM response as JSON: ${error.message}`));
-        if (CONFIG.debug) {
-          console.debug(chalk.gray(`Raw response: ${fullResponse}`));
-        }
-        throw new Error('Invalid response format from LLM. Expected JSON.');
       }
       
-      // Create the final report
-      const report = {
-        meta: {
-          generatedAt: new Date().toISOString(),
-          tasksAnalyzed: tasksData.tasks.length,
-          thresholdScore: thresholdScore,
-          projectName: tasksData.meta?.projectName || 'Your Project Name',
-          usedResearch: useResearch
-        },
-        complexityAnalysis: complexityAnalysis
-      };
+      // Fall back to Claude if research fails or is not enabled
+      const complexityAnalysis = await analyzeWithOllama(prompt);
       
-      // Write the report to file
-      console.log(chalk.blue(`Writing complexity report to ${outputPath}...`));
-      writeJSON(outputPath, report);
+      stopLoadingIndicator(loadingIndicator);
       
-      console.log(chalk.green(`Task complexity analysis complete. Report written to ${outputPath}`));
+      // Write results to file
+      writeJSON(outputPath, complexityAnalysis);
       
-      // Display a summary of findings
-      const highComplexity = complexityAnalysis.filter(t => t.complexityScore >= 8).length;
-      const mediumComplexity = complexityAnalysis.filter(t => t.complexityScore >= 5 && t.complexityScore < 8).length;
-      const lowComplexity = complexityAnalysis.filter(t => t.complexityScore < 5).length;
-      const totalAnalyzed = complexityAnalysis.length;
+      log('success', `Task complexity analysis saved to ${outputPath}`);
+      console.log(chalk.green(`Task complexity analysis saved to ${outputPath}`));
       
-      console.log('\nComplexity Analysis Summary:');
-      console.log('----------------------------');
-      console.log(`Tasks in input file: ${tasksData.tasks.length}`);
-      console.log(`Tasks successfully analyzed: ${totalAnalyzed}`);
-      console.log(`High complexity tasks: ${highComplexity}`);
-      console.log(`Medium complexity tasks: ${mediumComplexity}`);
-      console.log(`Low complexity tasks: ${lowComplexity}`);
-      console.log(`Sum verification: ${highComplexity + mediumComplexity + lowComplexity} (should equal ${totalAnalyzed})`);
-      console.log(`Research-backed analysis: ${useResearch ? 'Yes' : 'No'}`);
-      console.log(`\nSee ${outputPath} for the full report and expansion commands.`);
-      
+      return complexityAnalysis;
     } catch (error) {
       if (streamingInterval) clearInterval(streamingInterval);
       stopLoadingIndicator(loadingIndicator);
-      throw error;
+      
+      log('error', `Error analyzing task complexity: ${error.message}`);
+      console.error(chalk.red(`Error analyzing task complexity: ${error.message}`));
+      
+      if (CONFIG.debug) {
+        console.error(error);
+      }
+      
+      process.exit(1);
     }
   } catch (error) {
-    console.error(chalk.red(`Error analyzing task complexity: ${error.message}`));
+    log('error', `Error analyzing task complexity: ${error.message}`);
+    console.error(chalk.red(`Error: ${error.message}`));
+    
+    if (CONFIG.debug) {
+      console.error(error);
+    }
+    
     process.exit(1);
+  }
+}
+
+/**
+ * Analyze task complexity with Ollama
+ * @param {string} prompt - The analysis prompt
+ * @returns {Object} Complexity analysis
+ */
+async function analyzeWithOllama(prompt) {
+  let fullResponse = '';
+  let streamingInterval = null;
+  
+  try {
+    // Update loading indicator to show streaming progress
+    let dotCount = 0;
+    const readline = await import('readline');
+    streamingInterval = setInterval(() => {
+      readline.cursorTo(process.stdout, 0);
+      process.stdout.write(`Receiving streaming response from Ollama${'.'.repeat(dotCount)}`);
+      dotCount = (dotCount + 1) % 4;
+    }, 500);
+    
+    // Call the LLM API with streaming
+    const response = await fetch(`${OLLAMA_API_URL}/api/chat`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: OLLAMA_MODEL,
+        messages: [
+          {
+            role: 'system',
+            content: "You are an expert software architect and project manager analyzing task complexity. Respond only with valid JSON."
+          },
+          {
+            role: 'user',
+            content: prompt
+          }
+        ],
+        stream: true
+      })
+    });
+
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      throw { 
+        status: response.status, 
+        message: error.error || `HTTP error ${response.status}` 
+      };
+    }
+    
+    // Process the stream
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    
+    let done = false;
+    while (!done) {
+      const { value, done: doneReading } = await reader.read();
+      done = doneReading;
+      
+      if (value) {
+        const chunk = decoder.decode(value, { stream: true });
+        try {
+          // Ollama returns each chunk as a JSON object with a "message" field
+          const lines = chunk.split('\n').filter(line => line.trim());
+          
+          for (const line of lines) {
+            try {
+              const data = JSON.parse(line);
+              if (data.message && data.message.content) {
+                fullResponse += data.message.content;
+              }
+            } catch (e) {
+              // Skip invalid JSON
+              if (CONFIG.debug) {
+                log('debug', `Error parsing JSON: ${e.message}, Line: ${line}`);
+              }
+            }
+          }
+        } catch (e) {
+          // If parsing fails, just append the raw chunk
+          fullResponse += chunk;
+        }
+      }
+    }
+    
+    if (streamingInterval) clearInterval(streamingInterval);
+    
+    log('info', "Completed streaming response from Ollama!");
+    log('debug', `Streaming response length: ${fullResponse.length} characters`);
+    
+    // Find JSON array in the response
+    let startIdx = fullResponse.indexOf('[');
+    let endIdx = fullResponse.lastIndexOf(']');
+    
+    if (startIdx === -1 || endIdx === -1) {
+      throw new Error("Could not find valid JSON array in the response");
+    }
+    
+    // Extract and parse the JSON
+    const jsonText = fullResponse.substring(startIdx, endIdx + 1);
+    const parsedResult = JSON.parse(jsonText);
+    
+    // Check for task coverage against all tasks in the prompt
+    // This will be determined by task IDs mentioned in the prompt
+    const taskIds = prompt.match(/Task ID: (\d+)/g)
+      ?.map(match => parseInt(match.replace('Task ID: ', ''), 10))
+      ?.filter(id => !isNaN(id)) || [];
+    
+    // Check for missing tasks
+    const missingTaskIds = taskIds.filter(id => 
+      !parsedResult.some(analysis => analysis.taskId === id)
+    );
+    
+    if (missingTaskIds.length > 0) {
+      log('warn', `Missing complexity analysis for tasks: ${missingTaskIds.join(', ')}`);
+      
+      // TODO: Could add retry logic here to get missing tasks
+    }
+    
+    return parsedResult;
+  } catch (error) {
+    if (streamingInterval) clearInterval(streamingInterval);
+    
+    // Get user-friendly error message
+    const userMessage = handleOllamaError(error);
+    log('error', userMessage);
+    throw new Error(userMessage);
   }
 }
 

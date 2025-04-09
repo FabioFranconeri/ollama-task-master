@@ -321,6 +321,66 @@ function detectCamelCaseFlags(args) {
   return camelCaseFlags;
 }
 
+/**
+ * Check if Ollama is available
+ * @returns {Promise<boolean>} True if Ollama is available
+ */
+async function isOllamaAvailable() {
+  const OLLAMA_API_URL = process.env.OLLAMA_API_URL || 'http://localhost:11434';
+  
+  try {
+    const fetch = (await import('node-fetch')).default;
+    const response = await fetch(`${OLLAMA_API_URL}/api/version`, {
+      method: 'GET',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      timeout: 3000 // 3 seconds timeout
+    });
+    
+    if (response.ok) {
+      return true;
+    }
+    
+    return false;
+  } catch (error) {
+    log('warn', `Ollama not available: ${error.message}`);
+    return false;
+  }
+}
+
+/**
+ * Check if model is available in Ollama
+ * @param {string} model - Model name
+ * @returns {Promise<boolean>} True if model is available
+ */
+async function isModelAvailable(model) {
+  const OLLAMA_API_URL = process.env.OLLAMA_API_URL || 'http://localhost:11434';
+  
+  try {
+    const fetch = (await import('node-fetch')).default;
+    const response = await fetch(`${OLLAMA_API_URL}/api/tags`, {
+      method: 'GET',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      timeout: 3000 // 3 seconds timeout
+    });
+    
+    if (response.ok) {
+      const data = await response.json();
+      if (data.models) {
+        return data.models.some(m => m.name === model);
+      }
+    }
+    
+    return false;
+  } catch (error) {
+    log('warn', `Could not check Ollama models: ${error.message}`);
+    return false;
+  }
+}
+
 // Export all utility functions and configuration
 export {
   CONFIG,
@@ -337,5 +397,7 @@ export {
   truncate,
   findCycles,
   toKebabCase,
-  detectCamelCaseFlags
+  detectCamelCaseFlags,
+  isOllamaAvailable,
+  isModelAvailable
 }; 
